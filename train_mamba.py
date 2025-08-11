@@ -236,6 +236,13 @@ class DistAdam(torch.optim.Optimizer):
             grad = torch.empty_like(params[-1])
             for base_i in range(len(params)):
                 grad = params[base_i].grad
+                if grad is None:
+                    print(f"ERROR: Parameter {base_i} in group has None gradient!")
+                    print(f"Parameter shape: {params[base_i].shape}")
+                    print(f"Parameter name: {[name for name, param in model.named_parameters() if param is params[base_i]]}")
+                    print(f"Parameter requires_grad: {params[base_i].requires_grad}")
+                    # Create zero gradient to prevent crash
+                    raise ValueError(f"Parameter {base_i} in group has None gradient!")
                 rank_size = grad.shape[0] // world_size
                 grad_slice = torch.empty_like(grad[:rank_size])
                 reduce_scatter_futures.append(dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future())
@@ -377,19 +384,218 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         return x
 
-class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int):
+# -----------------------------------------------------------------------------
+# Mamba2 Integration
+
+try:
+    from mamba_ssm.modules.mamba2 import Mamba2
+    # Also check if causal_conv1d is available
+    try:
+        from causal_conv1d.cpp_functions import causal_conv1d_fwd_function
+    except ImportError:
+        raise ImportError("causal_conv1d not properly installed. Mamba layers may not work correctly in distributed training.")
+        
+    MAMBA_AVAILABLE = True
+except ImportError:
+    print("Warning: mamba_ssm with Mamba2 not found. Mamba layers will be disabled.")
+    MAMBA_AVAILABLE = False
+    Mamba2 = None
+
+class MambaBlock(nn.Module):
+    """Mamba2 block with proper hybrid tensor/data parallelism"""
+    def __init__(self, dim: int, layer_idx: int = None):
         super().__init__()
-        # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
-        self.attn = CausalSelfAttention(dim, num_heads, max_seq_len) if layer_idx != 7 else None
-        self.mlp = MLP(dim)
+        if not MAMBA_AVAILABLE:
+            raise ImportError("mamba_ssm with Mamba2 is required for Mamba layers")
+        
+        # Hybrid Tensor/Data Parallelism Solution:
+        # - Enable Mamba tensor parallelism for memory efficiency  
+        # - Disable problematic features that cause stride/tensor size issues
+        # - Let DDP wrap everything for gradient synchronization
+        
+        world_size = 1
+        process_group = None
+        # if dist.is_initialized():
+        #     world_size = dist.get_world_size()
+        #     process_group = dist.group.WORLD
+        
+        self.world_size = world_size
+        
+        self.mamba = Mamba2(
+            d_model=dim,
+            d_state=64,     # Reduced from 128 to save memory
+            d_conv=4,
+            expand=2,       # Keep standard expand
+            ngroups=1,      # Keep simple since process_group=None
+            layer_idx=layer_idx,
+            process_group=process_group,  # None for single-GPU-mode per layer
+            sequence_parallel=False,      # Disabled for compatibility
+            use_mem_eff_path=False,       # Disabled to avoid causal_conv1d issues
+            device=None,
+            dtype=None
+        )
+        
+        # Don't override activation - that causes assertion errors
+        # Instead, we'll handle the stride issue differently in the forward pass
+    
+    def forward(self, x: Tensor, ve: Tensor | None = None, lambdas: Tensor | None = None, block_mask=None):
+        """
+        Forward pass compatible with attention layer interface.
+        Args:
+            x: Input tensor (B, L, D)
+            ve: Value embeddings (ignored for Mamba)
+            lambdas: Lambda weights (ignored for Mamba)
+            block_mask: Block mask (ignored for Mamba)
+        Returns:
+            Output tensor (B, L, D)
+        """
+        # Ensure input matches expected dtype for distributed operations
+        x_input = x.to(dtype=torch.bfloat16) if x.dtype != torch.bfloat16 else x
+        
+        # Ensure tensor is contiguous to avoid stride issues in causal_conv1d
+        x_input = x_input.contiguous()
+        
+        # Advanced approach: Temporarily disable causal_conv1d to force fallback path
+        # This avoids stride issues while keeping proper activation
+        
+        # Import the module where causal_conv1d_fn is used
+        import mamba_ssm.modules.mamba2 as mamba2_module
+        
+        # Save original causal_conv1d_fn
+        original_causal_conv1d_fn = getattr(mamba2_module, 'causal_conv1d_fn', None)
+        
+        try:
+            # Temporarily set causal_conv1d_fn to None to force fallback path
+            mamba2_module.causal_conv1d_fn = None
+            
+            # Now run Mamba forward - it will use the fallback conv1d path
+            output = self.mamba(x_input)
+            
+        finally:
+            # Restore original causal_conv1d_fn
+            mamba2_module.causal_conv1d_fn = original_causal_conv1d_fn
+        
+        return output
+
+class Block(nn.Module):
+    """Block supporting both Attention and Mamba layers based on architecture string"""
+    def __init__(self, dim: int, num_heads: int, max_seq_len: int, layer_idx: int, arch: str = 'T'):
+        super().__init__()
+        
+        # Architecture-based layer selection
+        if arch.lower() == 'm' and MAMBA_AVAILABLE:
+            # Mamba layer
+            self.mixer = MambaBlock(dim, layer_idx=layer_idx)
+            self.mixer_type = "mamba"
+        elif arch.lower() == 'n':
+            # No mixer (skip layer) - only if explicitly specified in architecture
+            self.mixer = None
+            self.mixer_type = "none"
+        elif layer_idx == 7 and arch.lower() == 't':
+            # Skip attention of blocks.7 (the 8th layer) by @YouJiacheng - only for standard attention
+            self.mixer = None
+            self.mixer_type = "none"
+        else:
+            # Standard attention layer (default)
+            self.mixer = CausalSelfAttention(dim, num_heads, max_seq_len)
+            self.mixer_type = "attention"
+            
+        # Add MLP for uppercase architectures (T, M) or if not specified
+        if arch.isupper() or len(arch) == 0:
+            self.mlp = MLP(dim)
+        else:
+            self.mlp = nn.Identity()
 
     def forward(self, x: Tensor, ve: Tensor | None, x0: Tensor, lambdas: Tensor, sa_lambdas: Tensor, block_mask: BlockMask):
+        # Simple forward pass - no gradient checkpointing to avoid DDP issues
         x = lambdas[0] * x + lambdas[1] * x0
-        if self.attn is not None:
-            x = x + self.attn(norm(x), ve, sa_lambdas, block_mask)
+        if self.mixer is not None:
+            if self.mixer_type == "mamba":
+                # Mamba doesn't use value embeddings, block_mask, or sa_lambdas  
+                x = x + self.mixer(norm(x), None, None, None)
+            elif self.mixer_type == "attention":
+                # Standard attention path
+                x = x + self.mixer(norm(x), ve, sa_lambdas, block_mask)
         x = x + self.mlp(norm(x))
         return x
+
+def parse_architecture_string(arch_str: str, num_layers: int):
+    """
+    Parse architecture string into list of layer types.
+    
+    Args:
+        arch_str: Architecture string like "tmtmtm" or "TMmMtT"
+        num_layers: Total number of layers
+        
+    Returns:
+        List of architecture characters, repeated/truncated to match num_layers
+    """
+    if not arch_str:
+        # Default to all attention with MLP
+        return ['T'] * num_layers
+    
+    # If string is shorter than num_layers, repeat it
+    if len(arch_str) < num_layers:
+        repeats = (num_layers + len(arch_str) - 1) // len(arch_str)
+        arch_str = arch_str * repeats
+    
+    # Truncate to exact length
+    return list(arch_str[:num_layers])
+
+def create_architecture_pattern(pattern_name: str, num_layers: int):
+    """
+    Create common architecture patterns.
+    
+    Args:
+        pattern_name: Name of the pattern:
+                     - "pure_attention": All attention layers (T)
+                     - "pure_mamba": All Mamba layers (M)  
+                     - "alternating": Alternating attention-mamba (tmtmtm...)
+                     - "alternating_blocks": Alternating blocks of 2 (ttmmttmm...)
+                     - "sandwich": Attention-mamba-attention sandwich (T...M...T)
+        num_layers: Total number of layers
+        
+    Returns:
+        Architecture string
+    """
+    if pattern_name == "pure_attention":
+        return "T" * num_layers
+    elif pattern_name == "pure_mamba":
+        return "M" * num_layers
+    elif pattern_name == "alternating":
+        return "".join(["t" if i % 2 == 0 else "m" for i in range(num_layers)])
+    elif pattern_name == "alternating_blocks":
+        pattern = ""
+        for i in range(num_layers):
+            if (i // 2) % 2 == 0:
+                pattern += "t"
+            else:
+                pattern += "m"
+        return pattern
+    elif pattern_name == "sandwich":
+        if num_layers < 3:
+            return "T" * num_layers
+        # First 1/3 attention, middle 1/3 mamba, last 1/3 attention
+        third = num_layers // 3
+        remainder = num_layers % 3
+        return "T" * (third + remainder) + "M" * third + "T" * third
+    else:
+        raise ValueError(f"Unknown pattern: {pattern_name}")
+
+# Convenience functions for common patterns
+def make_pure_attention(num_layers: int) -> str:
+    """Create architecture string for pure attention model."""
+    return create_architecture_pattern("pure_attention", num_layers)
+
+def make_pure_mamba(num_layers: int) -> str:
+    """Create architecture string for pure Mamba model.""" 
+    return create_architecture_pattern("pure_mamba", num_layers)
+
+def make_alternating(num_layers: int) -> str:
+    """Create architecture string for alternating attention-mamba."""
+    return create_architecture_pattern("alternating", num_layers)
+
+
 
 # -----------------------------------------------------------------------------
 # The main model
@@ -398,14 +604,40 @@ def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int, architecture: str = None):
+        """
+        GPT model with optional Mamba layer support.
+        
+        Args:
+            architecture: Optional architecture string. Each character specifies a layer type:
+                         - 'T': Attention with MLP (default)
+                         - 't': Attention without MLP  
+                         - 'M': Mamba with MLP
+                         - 'm': Mamba without MLP
+                         If None, defaults to all attention with MLP.
+        """
         super().__init__()
         vocab_size = next_multiple_of_n(vocab_size, n=128)
         self.embed = nn.Embedding(vocab_size, model_dim)
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
-        self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
+        
+        # Parse architecture string or default to all attention
+        if architecture is None:
+            arch_layers = ['T'] * num_layers  # Default: all attention with MLP
+        else:
+            arch_layers = parse_architecture_string(architecture, num_layers)
+        
+        # Create blocks - minimal change from train_gpt.py
+        self.blocks = nn.ModuleList([
+            Block(model_dim, num_heads, max_seq_len, i, arch_layers[i]) 
+            for i in range(num_layers)
+        ])
+        
+        # Store architecture for logging
+        self.architecture = ''.join(arch_layers) if architecture else 'T' * num_layers
+        
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
         self.lm_head = CastedLinear(model_dim, vocab_size, use_fp8=True, x_s=(model_dim**0.5)/448, w_s=24/448, grad_s=1/448)
@@ -655,7 +887,7 @@ class Hyperparameters:
     train_seq_len = 48*1024 # FlexAttention sequence length
     val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
     # optimization
-    num_iterations = 1750 # number of iterations to run
+    num_iterations = 1750 + 750 # number of iterations to run
     cooldown_frac = 0.45 # fraction of training spent cooling down the learning rate
     # evaluation and logging
     val_loss_every = 125 # every how many steps to evaluate val loss? 0 for only at the end
@@ -666,12 +898,64 @@ class Hyperparameters:
     num_layers = 12
     num_heads = 6
     model_dim = 768
-
+    # architecture = "tmtmtmtmtmtm"  # Default hybrid pattern: alternating attention-mamba
+    architecture = "pure_attention"
+    
     # Experiment settings
-    experiment_name = "baseline"
+    experiment_name = "default"
     output_dir = "logs"  # Output directory for logs
 
+# Command line argument parsing for experiments
+def parse_experiment_args():
+    """Parse command line arguments for experiment configurations"""
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Train Mamba2-GPT Hybrid Model")
+    parser.add_argument("--experiment-name", type=str, default="default", help="Name of experiment")
+    parser.add_argument("--model-dim", type=int, default=768, help="Model dimension")
+    parser.add_argument("--num-layers", type=int, default=12, help="Number of layers")
+    parser.add_argument("--num-heads", type=int, default=6, help="Number of attention heads")
+    parser.add_argument("--architecture", type=str, default="pure_mamba", 
+                        help="Architecture string using hnet notation. Each char specifies layer type: "
+                             "t=attention, m=mamba, T=attention+MLP, M=mamba+MLP, n=no mixer. "
+                             "Examples: 'tmtm', 'TMTM', 'ttmmttmm'. "
+                             "Also supports patterns: 'pure_attention', 'pure_mamba', 'alternating', "
+                             "'alternating_blocks', 'sandwich'")
+
+    parser.add_argument("--num-iterations", type=int, default=None, help="Override number of training iterations")
+    parser.add_argument("--output-dir", type=str, default="logs", help="Output directory for logs")
+    
+    args = parser.parse_args()
+    return args
+
+def update_args_from_cmdline(args: Hyperparameters):
+    """Update hyperparameters from command line arguments"""
+    cmd_args = parse_experiment_args()
+    
+    args.experiment_name = cmd_args.experiment_name
+    args.model_dim = cmd_args.model_dim
+    args.num_layers = cmd_args.num_layers
+    args.num_heads = cmd_args.num_heads
+    args.output_dir = cmd_args.output_dir
+    
+    # Set architecture string - support both patterns and direct strings
+    arch = cmd_args.architecture
+    if arch in ["pure_attention", "pure_mamba", "alternating", "alternating_blocks", "sandwich"]:
+        args.architecture = create_architecture_pattern(arch, args.num_layers)
+    else:
+        args.architecture = arch
+    
+    # Override iterations if specified
+    if cmd_args.num_iterations is not None:
+        args.num_iterations = cmd_args.num_iterations
+    
+    return args
+
 args = Hyperparameters()
+
+# Check if we're being called from command line (for experiments)
+if len(sys.argv) > 1:
+    args = update_args_from_cmdline(args)
 
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
@@ -704,6 +988,7 @@ if master_process:
                 "model_dim": args.model_dim,
                 "num_layers": args.num_layers, 
                 "num_heads": args.num_heads,
+                "architecture": args.architecture,
                 "num_iterations": args.num_iterations,
                 "train_seq_len": args.train_seq_len,
                 "val_seq_len": args.val_seq_len,
@@ -731,18 +1016,92 @@ def nvidia_smi():
 print0(nvidia_smi())
 print0("="*100)
 
-model: nn.Module = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=max(args.train_seq_len, args.val_seq_len)).cuda()
+model: nn.Module = GPT(vocab_size=args.vocab_size, num_layers=args.num_layers, num_heads=args.num_heads, model_dim=args.model_dim, 
+                       max_seq_len=max(args.train_seq_len, args.val_seq_len),
+                       architecture=args.architecture).cuda()
+
+# DDP setup with unused parameter detection
+# Some layers may not be used (e.g., skipped attention in layer 7)
+# or parameters might not receive gradients in mixed architectures
+# from torch.nn.parallel import DistributedDataParallel as DDP
+
+# # Use find_unused_parameters=True to handle unused parameters gracefully
+# model = DDP(model, find_unused_parameters=True)
+
+# Log model architecture info (access underlying model if wrapped in DDP)
+underlying_model = model.module if hasattr(model, 'module') else model
+if hasattr(underlying_model, 'architecture') and underlying_model.architecture != 'T' * args.num_layers:
+    print0(f"Experiment: {args.experiment_name}")
+    print0(f"Model Architecture: {underlying_model.architecture}")
+    attention_count = underlying_model.architecture.count('t') + underlying_model.architecture.count('T')
+    mamba_count = underlying_model.architecture.count('m') + underlying_model.architecture.count('M') 
+    print0(f"Architecture: {attention_count} attention layers, {mamba_count} mamba layers")
+else:
+    print0(f"Experiment: {args.experiment_name} (standard GPT architecture)")
+
+print0(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+# Convert embeddings to bfloat16 (same as train_gpt.py)
 for m in model.modules():
     if isinstance(m, nn.Embedding):
         m.bfloat16()
+
+# Additional fix: Ensure Mamba2 modules use consistent dtypes
+# Note: We keep A_log in float32 for numerical stability (see mamba2.py:181 comment)
+# but ensure other parameters and linear layers match the model dtype
+for m in model.modules():
+    if hasattr(m, 'mamba'):
+        mamba = m.mamba
+        # Convert parameters that can safely use bfloat16
+        if hasattr(mamba, 'dt_bias'):
+            mamba.dt_bias.data = mamba.dt_bias.data.to(torch.bfloat16)
+        if hasattr(mamba, 'D'):
+            mamba.D.data = mamba.D.data.to(torch.bfloat16)
+        
+        # Ensure linear layers use bfloat16 for weights and biases
+        for name, param in mamba.named_parameters():
+            if 'A_log' not in name and param.dtype == torch.float32:
+                # Convert all non-A_log parameters to bfloat16
+                param.data = param.data.to(torch.bfloat16)
+        
+        # Specifically ensure distributed linear layers have correct dtype
+        if hasattr(mamba, 'in_proj') and hasattr(mamba.in_proj, 'weight'):
+            mamba.in_proj.weight.data = mamba.in_proj.weight.data.to(torch.bfloat16)
+            if mamba.in_proj.bias is not None:
+                mamba.in_proj.bias.data = mamba.in_proj.bias.data.to(torch.bfloat16)
+        if hasattr(mamba, 'out_proj') and hasattr(mamba.out_proj, 'weight'):
+            mamba.out_proj.weight.data = mamba.out_proj.weight.data.to(torch.bfloat16)
+            if mamba.out_proj.bias is not None:
+                mamba.out_proj.bias.data = mamba.out_proj.bias.data.to(torch.bfloat16)
+
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
 # collect the parameters to optimize
-hidden_matrix_params = [p for n, p in model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
-embed_params = [p for n, p in model.named_parameters() if "embed" in n]
-scalar_params = [p for p in model.parameters() if p.ndim < 2]
-head_params = [model.lm_head.weight]
+# Need to be careful with DDP wrapped model
+underlying_model = model.module if hasattr(model, 'module') else model
+
+hidden_matrix_params = [p for n, p in underlying_model.blocks.named_parameters() if p.ndim >= 2 and "embed" not in n]
+embed_params = [p for n, p in underlying_model.named_parameters() if "embed" in n]
+scalar_params = [p for p in underlying_model.parameters() if p.ndim < 2]
+head_params = [underlying_model.lm_head.weight]
+
+# Debug parameter collection
+print0(f"Collected {len(hidden_matrix_params)} hidden matrix params")
+print0(f"Collected {len(embed_params)} embedding params")
+print0(f"Collected {len(scalar_params)} scalar params")
+print0(f"Collected {len(head_params)} head params")
+
+# Check for any parameters that might be missing
+all_collected_params = set(hidden_matrix_params + embed_params + scalar_params + head_params)
+all_model_params = set(model.parameters())
+missing_params = all_model_params - all_collected_params
+
+if missing_params:
+    print0(f"WARNING: {len(missing_params)} parameters not collected for optimization!")
+    for i, param in enumerate(missing_params):
+        param_names = [name for name, p in model.named_parameters() if p is param]
+        print0(f"  Missing param {i}: shape={param.shape}, names={param_names}")
 
 # init the optimizer(s)
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
@@ -787,7 +1146,8 @@ warmup_steps = 10
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
 train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
-for _ in range(warmup_steps):
+for step_i in range(warmup_steps):
+    print(f"Warmup step {step_i}")
     inputs, targets = next(train_loader)
     model(inputs, targets, get_window_size_blocks(1)).backward()
     for opt in optimizers:

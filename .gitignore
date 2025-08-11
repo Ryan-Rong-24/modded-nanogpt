@@ -1,4 +1,8 @@
 fineweb10B/
+fineweb10B_bytes/
 pylog124M/
 __pycache__/
 logs/
+.python-version
+uv.lock
+wandb/

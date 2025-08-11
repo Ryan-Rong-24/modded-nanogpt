@@ -6,27 +6,157 @@ import uuid
 import time
 import copy
 import glob
-from dataclasses import dataclass
-from functools import lru_cache, partial # Added partial for hook registration
+import json
+from dataclasses import dataclass, field
+from functools import lru_cache, partial
 from pathlib import Path
+from typing import List, Union, Optional
+from collections import namedtuple
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
-torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
-from torch import Tensor, nn
-import torch.nn.functional as F
-import torch.distributed as dist
-import math
-import tiktoken
 try:
     import wandb
     WANDB_AVAILABLE = True
 except ImportError:
     print("Warning: wandb not available. Install with \'pip install wandb\' for experiment tracking.")
     WANDB_AVAILABLE = False
+torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
+from torch import Tensor, nn
+import torch.nn.functional as F
+import torch.distributed as dist
+import numpy as np
+import math
+
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 #torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
+
+# -----------------------------------------------------------------------------
+# H-Net Configuration Classes
+
+@dataclass
+class AttnConfig:
+    num_heads: List = field(default_factory=list)
+    rotary_emb_dim: List = field(default_factory=list)
+    window_size: List = field(default_factory=list)
+
+@dataclass
+class SSMConfig:
+    d_conv: int = 4
+    expand: int = 2
+    d_state: int = 128
+    chunk_size: int = 256
+
+@dataclass
+class HNetConfig:
+    arch_layout: List[Union[str, List]] = field(default_factory=list)
+    d_model: List[int] = field(default_factory=list)
+    # intermediate dimension for the FFNs (0 indicates no FFN)
+    d_intermediate: List[int] = field(default_factory=list)
+    vocab_size: int = 256
+    ssm_cfg: SSMConfig = field(default_factory=SSMConfig)
+    attn_cfg: AttnConfig = field(default_factory=AttnConfig)
+    tie_embeddings: bool = False
+
+# -----------------------------------------------------------------------------
+# H-Net ByteTokenizer (from generate.py)
+
+class ByteTokenizer:
+    def __init__(self):
+        self.vocab_size = 256
+        self.bos_idx = 254
+        self.eos_idx = 255
+        self.dtype = np.uint8
+
+    def encode(self, seqs, add_bos=False, add_eos=False, **kwargs):
+        if isinstance(seqs, str):
+            seqs = [seqs]
+        total_outputs = []
+        for text in seqs:
+            text_byte = text.encode("utf-8")
+            if add_bos:
+                text_byte = bytes([self.bos_idx]) + text_byte
+            if add_eos:
+                text_byte = text_byte + bytes([self.eos_idx])
+            text_byte = bytearray(text_byte)
+            text_byte_ids = np.array(text_byte, dtype=self.dtype)
+            total_outputs.append(text_byte_ids)
+        return total_outputs[0] if len(total_outputs) == 1 else total_outputs
+
+    def decode(self, tokens, **kwargs):
+        if isinstance(tokens, torch.Tensor):
+            tokens = tokens.cpu().numpy()
+        if isinstance(tokens, np.ndarray):
+            tokens = tokens.tolist()
+        return bytearray(tokens).decode("utf-8", errors="ignore")
+
+# -----------------------------------------------------------------------------
+# H-Net Model Loading Functions
+
+class SimpleHNet(nn.Module):
+    """Minimal H-Net implementation for loading pretrained embeddings"""
+    def __init__(self, config: HNetConfig, device=None, dtype=None):
+        super().__init__()
+        self.config = config
+        vocab_size = config.vocab_size
+        d_embed = config.d_model[0]
+        
+        # Just the embedding layer - we'll extract this for ByteGPT
+        self.embeddings = nn.Embedding(vocab_size, d_embed, device=device, dtype=dtype)
+        self.lm_head = nn.Linear(d_embed, vocab_size, bias=False, device=device, dtype=dtype)
+
+def load_hnet_config(config_path: str):
+    """Load H-Net configuration from JSON file"""
+    with open(config_path, "r") as f:
+        config_dict = json.load(f)
+    
+    # Create config objects
+    attn_cfg = AttnConfig(**config_dict.pop("attn_cfg"))
+    ssm_cfg = SSMConfig(**config_dict.pop("ssm_cfg"))
+    hnet_cfg = HNetConfig(**config_dict, attn_cfg=attn_cfg, ssm_cfg=ssm_cfg)
+    
+    return hnet_cfg
+
+def load_hnet_pretrained_embeddings(model_path: str, config_path: str, device="cuda"):
+    """Load pretrained H-Net embeddings"""
+    if not os.path.exists(model_path):
+        print(f"Warning: Pretrained H-Net model not found at {model_path}")
+        return None, None
+    
+    try:
+        # Load configuration
+        hnet_config = load_hnet_config(config_path)
+        
+        # Create minimal model to load embeddings
+        hnet_model = SimpleHNet(hnet_config, device=device, dtype=torch.bfloat16)
+        
+        # Load pretrained weights
+        state_dict = torch.load(model_path, map_location=device, weights_only=False)
+        
+        # Extract only embedding weights if they exist
+        embedding_weights = None
+        if 'embeddings.weight' in state_dict:
+            embedding_weights = state_dict['embeddings.weight']
+        elif 'backbone.embeddings.weight' in state_dict:
+            embedding_weights = state_dict['backbone.embeddings.weight']
+        else:
+            # Search for embedding weights with different key patterns
+            for key in state_dict.keys():
+                if 'embed' in key.lower() and 'weight' in key:
+                    embedding_weights = state_dict[key]
+                    break
+        
+        if embedding_weights is not None:
+            print(f"Loaded H-Net pretrained embeddings: {embedding_weights.shape}")
+            return embedding_weights, hnet_config
+        else:
+            print("Warning: Could not find embedding weights in pretrained H-Net model")
+            return None, hnet_config
+            
+    except Exception as e:
+        print(f"Warning: Failed to load pretrained H-Net model: {e}")
+        return None, None
 
 # -----------------------------------------------------------------------------
 # Custom operators: FP8 matmul by @YouJiacheng
@@ -392,24 +522,37 @@ class Block(nn.Module):
         return x
 
 # -----------------------------------------------------------------------------
-# The main model
+# The main model (ByteGPT with H-Net pretrained tokenizer)
 
 def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
 
-class GPT(nn.Module):
-    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int):
+class ByteGPT(nn.Module):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int, pretrained_embeddings=None):
         super().__init__()
-        vocab_size = next_multiple_of_n(vocab_size, n=128)
+        # For byte-level tokenization, vocab_size is always 256, no need to pad
+        assert vocab_size == 256, "ByteGPT only supports byte-level tokenization (vocab_size=256)"
+        
         self.embed = nn.Embedding(vocab_size, model_dim)
+        
+        # Initialize with H-Net pretrained embeddings if available
+        if pretrained_embeddings is not None:
+            print(f"Initializing embeddings with H-Net pretrained weights: {pretrained_embeddings.shape}")
+            if pretrained_embeddings.shape[1] == model_dim:
+                with torch.no_grad():
+                    self.embed.weight.copy_(pretrained_embeddings)
+            else:
+                print(f"Warning: Pretrained embedding dim {pretrained_embeddings.shape[1]} != model_dim {model_dim}, skipping initialization")
+        
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
         self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
-        # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
-        # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
-        self.lm_head = CastedLinear(model_dim, vocab_size, use_fp8=True, x_s=(model_dim**0.5)/448, w_s=24/448, grad_s=1/448)
+        
+        # Much smaller lm_head due to 256 vs 50k vocab!
+        self.lm_head = CastedLinear(model_dim, vocab_size, use_fp8=True, x_s=(model_dim**0.5)/32, w_s=8/32, grad_s=1/32)
         self.lm_head.weight.detach().zero_() # @Grad62304977
+        
         # Add learnable skip connection weights for decoder layers
         assert num_layers % 2 == 0
         pad = (-num_layers * 5) % dist.get_world_size()
@@ -419,17 +562,19 @@ class GPT(nn.Module):
             *[torch.tensor([0.5, 0.5]) for _ in range(num_layers)], # SA lambdas
             torch.ones(pad),
         ]))
-        # set learning rates
+        
+        # set learning rates (higher for embeddings due to smaller vocab)
         for param in self.embed.parameters():
-            param.lr_mul = 75.
+            param.lr_mul = 100.  # Higher than original 75 due to smaller vocab
         for param in self.value_embeds.parameters():
-            param.lr_mul = 75.
-        self.lm_head.weight.lr_mul = 27.5
+            param.lr_mul = 100.
+        self.lm_head.weight.lr_mul = 50.0  # Higher than original 27.5
         self.scalars.lr_mul = 5.0
 
     def create_blockmasks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
         BLOCK_SIZE = 128
-        docs = (input_seq == 50256).cumsum(0)
+        # For byte-level, use BOS token (254) instead of document separator (50256)
+        docs = (input_seq == 254).cumsum(0)  # BOS token for byte tokenizer
 
         def document_causal(b, h, q_idx, kv_idx):
             causal_mask = q_idx >= kv_idx
@@ -508,63 +653,83 @@ class GPT(nn.Module):
         return loss
 
 # -----------------------------------------------------------------------------
-# Distributed data loader
+# Data loading functions for byte-level data
 
-def _load_data_shard(file: Path):
+def _load_data_shard_bytes(file: Path):
+    """Load data shard that contains byte-level tokens"""
     header = torch.from_file(str(file), False, 256, dtype=torch.int32) # header is 256 int32
     assert header[0] == 20240520, "magic number mismatch in the data .bin file"
     assert header[1] == 1, "unsupported version"
     num_tokens = int(header[2]) # number of tokens (claimed)
+    
     with file.open("rb", buffering=0) as f:
-        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True) # avoid pin_memory copy by @YouJiacheng
+        # The converted files store byte tokens as uint16 for compatibility
+        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True)
         f.seek(256 * 4)
-        nbytes = f.readinto(tokens.numpy()) # avoid bytes->array copy by @YouJiacheng
+        nbytes = f.readinto(tokens.numpy())
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
-    return tokens
+    
+    # Convert uint16 back to uint8 byte tokens
+    byte_tokens = tokens.to(dtype=torch.uint8)
+    return byte_tokens
 
-# find world_size starting indicies, such that each begins with token 50256 and local_batches don't overlap
-def find_batch_starts(tokens: Tensor, pos: int, local_batch_size: int, max_batch_span: int):
-    boundary_mask = tokens[pos : pos + max_batch_span] == 50256
+def find_batch_starts_bytes(tokens: Tensor, pos: int, local_batch_size: int, max_batch_span: int):
+    """Find batch starts for byte-level tokens (BOS = 254)"""
+    boundary_mask = tokens[pos : pos + max_batch_span] == 254  # BOS token for byte tokenizer
     boundary_positions = torch.nonzero(boundary_mask, as_tuple=False).squeeze(-1) + pos
+    
+    if len(boundary_positions) == 0:
+        # If no BOS found, use regular intervals (fallback)
+        starts = [pos + i * local_batch_size for i in range(dist.get_world_size())]
+        return starts[:dist.get_world_size()], max_batch_span
+    
     start = boundary_positions[0].item()
     starts = []
     for i in range(1, len(boundary_positions)):
         end = boundary_positions[i].item() 
         if end - start >= local_batch_size:
-            starts.append(start) # append start once end pos is confirmed
+            starts.append(start)
             if len(starts) == dist.get_world_size():
                 return starts, end - pos
             start = end
-    assert False # increase max_batch_span if necessary
+    
+    # Fallback if not enough boundaries found
+    while len(starts) < dist.get_world_size():
+        starts.append(start)
+        start += local_batch_size
+    
+    return starts[:dist.get_world_size()], max_batch_span
 
-def distributed_data_generator(filename_pattern: str, batch_size: int, align_to_bos: bool):
+def distributed_data_generator_bytes(filename_pattern: str, batch_size: int, align_to_bos: bool):
+    """Data generator adapted for byte-level tokens"""
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     files = [Path(file) for file in sorted(glob.glob(filename_pattern))]
     assert batch_size % world_size == 0
     local_batch_size = batch_size // world_size
-    file_iter = iter(files) # use itertools.cycle(files) instead if you want to do multi-epoch training
-    tokens, pos = _load_data_shard(next(file_iter)), 0
-    max_batch_span = 2 * batch_size if align_to_bos else batch_size # provide buffer to handle samples up to length local_batch_size
+    file_iter = iter(files)
+    tokens, pos = _load_data_shard_bytes(next(file_iter)), 0
+    max_batch_span = 2 * batch_size if align_to_bos else batch_size
+    
     while True:
         if pos + max_batch_span + 1 >= len(tokens):
-            tokens, pos = _load_data_shard(next(file_iter)), 0
+            tokens, pos = _load_data_shard_bytes(next(file_iter)), 0
         if align_to_bos:
-            batch_starts, batch_span = find_batch_starts(tokens, pos, local_batch_size, max_batch_span)
+            batch_starts, batch_span = find_batch_starts_bytes(tokens, pos, local_batch_size, max_batch_span)
             start_idx = batch_starts[rank]
         else:
             batch_span = batch_size
             start_idx = pos + rank * local_batch_size
         buf = tokens[start_idx:][:local_batch_size + 1]
-        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True) # no sync on host side;
-        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # H2D in another stream isn't helpful.
+        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)
+        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True)
         pos += batch_span
         yield inputs, targets
 
 # -----------------------------------------------------------------------------
-# Text generation for evaluation
+# Text generation and metrics
 
-def generate_text_sample_gpt(model, tokenizer, device, max_tokens=100, temperature=0.8):
+def generate_text_sample_hnet(model, tokenizer, device, max_tokens=100, temperature=0.8):
     """Generate a sample text to evaluate model quality"""
     model.eval()
     
@@ -582,7 +747,7 @@ def generate_text_sample_gpt(model, tokenizer, device, max_tokens=100, temperatu
             seq_len = len(tokens)
             if seq_len % 128 != 0:
                 pad_len = 128 - (seq_len % 128)
-                tokens_padded = F.pad(tokens, (0, pad_len), value=50256)  # Pad with EOS token
+                tokens_padded = F.pad(tokens, (0, pad_len), value=0)
             else:
                 tokens_padded = tokens
                 
@@ -600,7 +765,7 @@ def generate_text_sample_gpt(model, tokenizer, device, max_tokens=100, temperatu
             probs = F.softmax(last_logits, dim=-1)
             next_token = torch.multinomial(probs, 1).item()
             
-            if next_token == 50256:  # Stop at EOS (GPT-2 endoftext token)
+            if next_token == tokenizer.eos_idx:  # Stop at EOS
                 break
                 
             generated.append(next_token)
@@ -616,26 +781,12 @@ def generate_text_sample_gpt(model, tokenizer, device, max_tokens=100, temperatu
     except:
         return f"[Failed to decode: {generated}]"
 
-def calculate_metrics_gpt(loss, input_tokens, target_tokens, tokenizer):
-    """Calculate perplexity and bits per byte for GPT with BPE tokenization"""
+def calculate_metrics_hnet(loss, tokens_in_batch, tokenizer):
+    """Calculate perplexity and bits per byte for H-Net"""
     perplexity = torch.exp(loss).item()
     
-    # For BPE tokenization, we need to calculate bits per byte
-    # by converting tokens back to text and measuring byte length
-    try:
-        # Convert a sample of tokens to text to estimate compression ratio
-        sample_tokens = target_tokens[:min(1000, len(target_tokens))].cpu().tolist()
-        sample_text = tokenizer.decode(sample_tokens)
-        sample_bytes = len(sample_text.encode('utf-8'))
-        
-        # Estimate bits per byte
-        # loss is nats per token, convert to bits per byte
-        bits_per_token = loss.item() / math.log(2)  # Convert nats to bits
-        tokens_per_byte = len(sample_tokens) / sample_bytes if sample_bytes > 0 else 1.0
-        bits_per_byte = bits_per_token * tokens_per_byte
-        
-    except:
-        bits_per_byte = float('nan')  # Fallback if decoding fails
+    # For byte-level tokenization, bits per byte is straightforward
+    bits_per_byte = loss.item() / math.log(2)  # Convert from nats to bits
     
     return {
         'perplexity': perplexity,
@@ -649,11 +800,14 @@ def calculate_metrics_gpt(loss, input_tokens, target_tokens, tokenizer):
 @dataclass
 class Hyperparameters:
     # data
-    train_files = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
-    val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
+    train_files = "data/fineweb10B_bytes/fineweb_train_*.bin" # input .bin to train on (byte-level)
+    val_files = "data/fineweb10B_bytes/fineweb_val_*.bin" # input .bin to eval validation loss on (byte-level)
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    train_seq_len = 48*1024 # FlexAttention sequence length
-    val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
+    train_seq_len = 48*1024 # sequence length
+    val_seq_len = 4*64*1024 # sequence length for validation
+    # H-Net specific
+    hnet_config_path = "hnet/configs/hnet_2stage_L.json"
+    hnet_model_path = "hnet/hnet_2stage_L.pt"  # Optional pretrained model path
     # optimization
     num_iterations = 1750 # number of iterations to run
     cooldown_frac = 0.45 # fraction of training spent cooling down the learning rate
@@ -666,9 +820,9 @@ class Hyperparameters:
     num_layers = 12
     num_heads = 6
     model_dim = 768
-
+    
     # Experiment settings
-    experiment_name = "baseline"
+    experiment_name = "hnet"
     output_dir = "logs"  # Output directory for logs
 
 args = Hyperparameters()
@@ -712,6 +866,7 @@ if master_process:
             },
             save_code=True
         )
+
 def print0(s, console=False):
     if master_process:
         with open(logfile, "a") as f:
@@ -725,13 +880,40 @@ print0("="*100)
 # log information about the hardware/software environment this is running on
 print0(f"Running Python {sys.version}")
 print0(f"Running PyTorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}")
+
 def nvidia_smi():
     import subprocess  # avoid top level import
     return subprocess.run(["nvidia-smi"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True).stdout
+
 print0(nvidia_smi())
 print0("="*100)
 
-model: nn.Module = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=max(args.train_seq_len, args.val_seq_len)).cuda()
+# Try to load H-Net pretrained embeddings
+print0("Attempting to load H-Net pretrained embeddings...")
+pretrained_embeddings, hnet_config = load_hnet_pretrained_embeddings(
+    args.hnet_model_path, 
+    args.hnet_config_path, 
+    device=device
+)
+
+if pretrained_embeddings is not None:
+    print0(f"Successfully loaded H-Net pretrained embeddings: {pretrained_embeddings.shape}")
+else:
+    print0("No pretrained embeddings loaded, using random initialization")
+
+# Create ByteGPT model with H-Net's pretrained embeddings
+model: nn.Module = ByteGPT(
+    vocab_size=256, 
+    num_layers=12, 
+    num_heads=8,  # Increase from 6 to 8 for 1024 dim (128 head_dim * 8 = 1024 dim)
+    model_dim=1024,  # Match H-Net's embedding dimension
+    max_seq_len=max(args.train_seq_len, args.val_seq_len),
+    pretrained_embeddings=pretrained_embeddings
+).cuda()
+
+print0(f"Created ByteGPT model with {sum(p.numel() for p in model.parameters())} parameters")
+print0("Model architecture: Optimized NanoGPT with H-Net byte-level tokenization")
+
 for m in model.modules():
     if isinstance(m, nn.Embedding):
         m.bfloat16()
@@ -744,12 +926,15 @@ embed_params = [p for n, p in model.named_parameters() if "embed" in n]
 scalar_params = [p for p in model.parameters() if p.ndim < 2]
 head_params = [model.lm_head.weight]
 
+print0(f"Parameter groups: hidden_matrix={len(hidden_matrix_params)}, embed={len(embed_params)}, scalar={len(scalar_params)}, head={len(head_params)}")
+
 # init the optimizer(s)
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
 optimizer1 = DistAdam(scalar_params + head_params + embed_params, lr=0.008, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0)
 optimizer2 = Muon(hidden_matrix_params, lr=0.05, momentum=0.95, weight_decay=0.0)
 optimizers = [optimizer1, optimizer2]
+
 for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
@@ -768,6 +953,7 @@ def get_lr(step: int):
 @lru_cache(1)
 def get_window_size_blocks_helper(window_size: int):
     return torch.tensor(window_size // 128, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+
 def get_window_size_blocks(step: int):
     x = step / args.num_iterations # progress in training
     assert 0 <= x <= 1
@@ -786,13 +972,16 @@ model: nn.Module = torch.compile(model, dynamic=False)
 warmup_steps = 10
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
-train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
+
+train_loader = distributed_data_generator_bytes(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
+
 for _ in range(warmup_steps):
     inputs, targets = next(train_loader)
     model(inputs, targets, get_window_size_blocks(1)).backward()
     for opt in optimizers:
         opt.step()
     model.zero_grad(set_to_none=True)
+
 model.load_state_dict(initial_state["model"])
 for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
     opt.load_state_dict(opt_state)
@@ -802,11 +991,13 @@ del train_loader, initial_state
 #        Training and validation       #
 ########################################
 
-train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
+train_loader = distributed_data_generator_bytes(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
 training_time_ms = 0
+
 # start the clock
 torch.cuda.synchronize()
 t0 = time.perf_counter()
+
 # begin training
 train_steps = args.num_iterations
 for step in range(train_steps + 1):
@@ -821,33 +1012,30 @@ for step in range(train_steps + 1):
         val_batch_size = world_size * args.val_seq_len
         assert args.val_tokens % val_batch_size == 0
         val_steps = args.val_tokens // val_batch_size
-        val_loader = distributed_data_generator(args.val_files, val_batch_size, align_to_bos=False)
+        val_loader = distributed_data_generator_bytes(args.val_files, val_batch_size, align_to_bos=False)
         val_loss = 0
-        sample_inputs, sample_targets = None, None
+        total_tokens = 0
         
         with torch.no_grad():
-            for i, (inputs, targets) in enumerate(val_loader):
-                if i >= val_steps:
-                    break
-                val_loss += model(inputs, targets, get_window_size_blocks(step))
-                
-                # Save sample for metrics calculation
-                if i == 0:
-                    sample_inputs, sample_targets = inputs, targets
+            for _ in range(val_steps):
+                inputs, targets = next(val_loader)
+                batch_loss = model(inputs, targets, get_window_size_blocks(step))
+                val_loss += batch_loss
+                total_tokens += len(targets)
         
         val_loss /= val_steps
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         
         # Calculate metrics
-        tokenizer = tiktoken.get_encoding("gpt2")
-        metrics = calculate_metrics_gpt(val_loss, sample_inputs, sample_targets, tokenizer)
+        tokenizer = ByteTokenizer()
+        metrics = calculate_metrics_hnet(val_loss, total_tokens, tokenizer)
         
         # Generate text sample (only on master process to avoid spam)
         sample_text = ""
         if master_process and step % (args.val_loss_every * 2) == 0:  # Generate less frequently
             try:
-                sample_text = generate_text_sample_gpt(model, tokenizer, device, max_tokens=50, temperature=0.8)
+                sample_text = generate_text_sample_hnet(model, tokenizer, device, max_tokens=50, temperature=0.8)
                 print0(f"Generated sample: '{sample_text}'", console=True)
             except Exception as e:
                 print0(f"Generation failed: {e}", console=True)
@@ -882,6 +1070,7 @@ for step in range(train_steps + 1):
     # --------------- TRAINING SECTION -----------------
     inputs, targets = next(train_loader)
     model(inputs, targets, get_window_size_blocks(step)).backward()
+    
     # set optimization hyperparameters
     for opt in optimizers:
         for group in opt.param_groups:
@@ -889,11 +1078,14 @@ for step in range(train_steps + 1):
     for group in optimizer2.param_groups:
         frac = min(step / 300, 1) # momentum warmup for muon
         group["momentum"] = (1 - frac) * 0.85 + frac * 0.95
+    
     # step the optimizers
     for opt in optimizers:
         opt.step()
+    
     # null the gradients
     model.zero_grad(set_to_none=True)
+    
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)

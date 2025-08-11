@@ -12,18 +12,19 @@ from pathlib import Path
 
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
-torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
-from torch import Tensor, nn
-import torch.nn.functional as F
-import torch.distributed as dist
-import math
-import tiktoken
 try:
     import wandb
     WANDB_AVAILABLE = True
 except ImportError:
     print("Warning: wandb not available. Install with \'pip install wandb\' for experiment tracking.")
     WANDB_AVAILABLE = False
+torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
+from torch import Tensor, nn
+import torch.nn.functional as F
+import torch.distributed as dist
+import numpy as np
+import math
+
 # use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention
 #torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
@@ -284,6 +285,37 @@ class DistAdam(torch.optim.Optimizer):
         torch.futures.collect_all(all_reduce_futures).wait()
 
 # -----------------------------------------------------------------------------
+# Byte-level tokenizer for H-Net
+
+class ByteTokenizer:
+    def __init__(self):
+        self.vocab_size = 256
+        self.bos_idx = 254  # Use 254 as BOS (Beginning of Sequence)
+        self.eos_idx = 255  # Use 255 as EOS (End of Sequence)
+        self.dtype = np.uint8
+
+    def encode(self, text_list, add_bos=False, add_eos=False):
+        """Encode a list of strings to byte-level tokens"""
+        outputs = []
+        for text in text_list:
+            text_bytes = text.encode("utf-8")
+            if add_bos:
+                text_bytes = bytes([self.bos_idx]) + text_bytes
+            if add_eos:
+                text_bytes = text_bytes + bytes([self.eos_idx])
+            token_ids = np.array(bytearray(text_bytes), dtype=self.dtype)
+            outputs.append(token_ids)
+        return outputs
+
+    def decode(self, tokens):
+        """Decode byte-level tokens back to string"""
+        if isinstance(tokens, torch.Tensor):
+            tokens = tokens.cpu().numpy()
+        if isinstance(tokens, np.ndarray):
+            tokens = tokens.tolist()
+        return bytearray(tokens).decode("utf-8", errors="ignore")
+
+# -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
 
 def norm(x: Tensor):
@@ -392,24 +424,27 @@ class Block(nn.Module):
         return x
 
 # -----------------------------------------------------------------------------
-# The main model
+# The main model (adapted for byte-level tokenization)
 
 def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
 
-class GPT(nn.Module):
+class ByteGPT(nn.Module):
     def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int):
         super().__init__()
-        vocab_size = next_multiple_of_n(vocab_size, n=128)
+        # For byte-level tokenization, vocab_size is always 256, no need to pad
+        assert vocab_size == 256, "ByteGPT only supports byte-level tokenization (vocab_size=256)"
+        
         self.embed = nn.Embedding(vocab_size, model_dim)
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
         self.blocks = nn.ModuleList([Block(model_dim, num_heads, max_seq_len, i) for i in range(num_layers)])
-        # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
-        # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
-        self.lm_head = CastedLinear(model_dim, vocab_size, use_fp8=True, x_s=(model_dim**0.5)/448, w_s=24/448, grad_s=1/448)
+        
+        # Much smaller lm_head due to 256 vs 50k vocab!
+        self.lm_head = CastedLinear(model_dim, vocab_size, use_fp8=True, x_s=(model_dim**0.5)/32, w_s=8/32, grad_s=1/32)
         self.lm_head.weight.detach().zero_() # @Grad62304977
+        
         # Add learnable skip connection weights for decoder layers
         assert num_layers % 2 == 0
         pad = (-num_layers * 5) % dist.get_world_size()
@@ -419,17 +454,19 @@ class GPT(nn.Module):
             *[torch.tensor([0.5, 0.5]) for _ in range(num_layers)], # SA lambdas
             torch.ones(pad),
         ]))
-        # set learning rates
+        
+        # set learning rates (higher for embeddings due to smaller vocab)
         for param in self.embed.parameters():
-            param.lr_mul = 75.
+            param.lr_mul = 100.  # Higher than original 75 due to smaller vocab
         for param in self.value_embeds.parameters():
-            param.lr_mul = 75.
-        self.lm_head.weight.lr_mul = 27.5
+            param.lr_mul = 100.
+        self.lm_head.weight.lr_mul = 50.0  # Higher than original 27.5
         self.scalars.lr_mul = 5.0
 
     def create_blockmasks(self, input_seq: Tensor, sliding_window_num_blocks: Tensor):
         BLOCK_SIZE = 128
-        docs = (input_seq == 50256).cumsum(0)
+        # For byte-level, use BOS token (254) instead of document separator (50256)
+        docs = (input_seq == 254).cumsum(0)  # BOS token for byte tokenizer
 
         def document_causal(b, h, q_idx, kv_idx):
             causal_mask = q_idx >= kv_idx
@@ -508,69 +545,90 @@ class GPT(nn.Module):
         return loss
 
 # -----------------------------------------------------------------------------
-# Distributed data loader
+# Distributed data loader adapted for byte-level tokenization
 
-def _load_data_shard(file: Path):
+def _load_data_shard_bytes(file: Path):
+    """Load data shard that contains byte-level tokens"""
     header = torch.from_file(str(file), False, 256, dtype=torch.int32) # header is 256 int32
     assert header[0] == 20240520, "magic number mismatch in the data .bin file"
     assert header[1] == 1, "unsupported version"
     num_tokens = int(header[2]) # number of tokens (claimed)
+    
     with file.open("rb", buffering=0) as f:
-        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True) # avoid pin_memory copy by @YouJiacheng
+        # The converted files store byte tokens as uint16 for compatibility
+        tokens = torch.empty(num_tokens, dtype=torch.uint16, pin_memory=True)
         f.seek(256 * 4)
-        nbytes = f.readinto(tokens.numpy()) # avoid bytes->array copy by @YouJiacheng
+        nbytes = f.readinto(tokens.numpy())
         assert nbytes == 2 * num_tokens, "number of tokens read does not match header"
-    return tokens
+    
+    # Convert uint16 back to uint8 byte tokens
+    byte_tokens = tokens.to(dtype=torch.uint8)
+    return byte_tokens
 
-# find world_size starting indicies, such that each begins with token 50256 and local_batches don't overlap
-def find_batch_starts(tokens: Tensor, pos: int, local_batch_size: int, max_batch_span: int):
-    boundary_mask = tokens[pos : pos + max_batch_span] == 50256
+# find world_size starting indices, such that each begins with BOS token and local_batches don't overlap
+def find_batch_starts_bytes(tokens: Tensor, pos: int, local_batch_size: int, max_batch_span: int):
+    """Find batch starts for byte-level tokens (BOS = 254)"""
+    boundary_mask = tokens[pos : pos + max_batch_span] == 254  # BOS token for byte tokenizer
     boundary_positions = torch.nonzero(boundary_mask, as_tuple=False).squeeze(-1) + pos
+    
+    if len(boundary_positions) == 0:
+        # If no BOS found, use regular intervals (fallback)
+        starts = [pos + i * local_batch_size for i in range(dist.get_world_size())]
+        return starts[:dist.get_world_size()], max_batch_span
+    
     start = boundary_positions[0].item()
     starts = []
     for i in range(1, len(boundary_positions)):
         end = boundary_positions[i].item() 
         if end - start >= local_batch_size:
-            starts.append(start) # append start once end pos is confirmed
+            starts.append(start)
             if len(starts) == dist.get_world_size():
                 return starts, end - pos
             start = end
-    assert False # increase max_batch_span if necessary
+    
+    # Fallback if not enough boundaries found
+    while len(starts) < dist.get_world_size():
+        starts.append(start)
+        start += local_batch_size
+    
+    return starts[:dist.get_world_size()], max_batch_span
 
-def distributed_data_generator(filename_pattern: str, batch_size: int, align_to_bos: bool):
+def distributed_data_generator_bytes(filename_pattern: str, batch_size: int, align_to_bos: bool):
+    """Data generator adapted for byte-level tokens"""
     rank = dist.get_rank()
     world_size = dist.get_world_size()
     files = [Path(file) for file in sorted(glob.glob(filename_pattern))]
     assert batch_size % world_size == 0
     local_batch_size = batch_size // world_size
-    file_iter = iter(files) # use itertools.cycle(files) instead if you want to do multi-epoch training
-    tokens, pos = _load_data_shard(next(file_iter)), 0
-    max_batch_span = 2 * batch_size if align_to_bos else batch_size # provide buffer to handle samples up to length local_batch_size
+    file_iter = iter(files)
+    tokens, pos = _load_data_shard_bytes(next(file_iter)), 0
+    max_batch_span = 2 * batch_size if align_to_bos else batch_size
+    
     while True:
         if pos + max_batch_span + 1 >= len(tokens):
-            tokens, pos = _load_data_shard(next(file_iter)), 0
+            tokens, pos = _load_data_shard_bytes(next(file_iter)), 0
         if align_to_bos:
-            batch_starts, batch_span = find_batch_starts(tokens, pos, local_batch_size, max_batch_span)
+            batch_starts, batch_span = find_batch_starts_bytes(tokens, pos, local_batch_size, max_batch_span)
             start_idx = batch_starts[rank]
         else:
             batch_span = batch_size
             start_idx = pos + rank * local_batch_size
         buf = tokens[start_idx:][:local_batch_size + 1]
-        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True) # no sync on host side;
-        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True) # H2D in another stream isn't helpful.
+        inputs = buf[:-1].to(device="cuda", dtype=torch.int32, non_blocking=True)
+        targets = buf[1:].to(device="cuda", dtype=torch.int64, non_blocking=True)
         pos += batch_span
         yield inputs, targets
 
 # -----------------------------------------------------------------------------
 # Text generation for evaluation
 
-def generate_text_sample_gpt(model, tokenizer, device, max_tokens=100, temperature=0.8):
+def generate_text_sample(model, tokenizer, device, max_tokens=100, temperature=0.8):
     """Generate a sample text to evaluate model quality"""
     model.eval()
     
     # Start with a simple prompt
     prompt = "The quick brown fox"
-    prompt_tokens = tokenizer.encode(prompt)
+    prompt_tokens = tokenizer.encode([prompt])[0]
     
     # Convert to tensor
     tokens = torch.tensor(prompt_tokens, dtype=torch.int32, device=device)
@@ -582,7 +640,7 @@ def generate_text_sample_gpt(model, tokenizer, device, max_tokens=100, temperatu
             seq_len = len(tokens)
             if seq_len % 128 != 0:
                 pad_len = 128 - (seq_len % 128)
-                tokens_padded = F.pad(tokens, (0, pad_len), value=50256)  # Pad with EOS token
+                tokens_padded = F.pad(tokens, (0, pad_len), value=0)
             else:
                 tokens_padded = tokens
                 
@@ -600,7 +658,7 @@ def generate_text_sample_gpt(model, tokenizer, device, max_tokens=100, temperatu
             probs = F.softmax(last_logits, dim=-1)
             next_token = torch.multinomial(probs, 1).item()
             
-            if next_token == 50256:  # Stop at EOS (GPT-2 endoftext token)
+            if next_token == tokenizer.eos_idx:  # Stop at EOS
                 break
                 
             generated.append(next_token)
@@ -616,26 +674,12 @@ def generate_text_sample_gpt(model, tokenizer, device, max_tokens=100, temperatu
     except:
         return f"[Failed to decode: {generated}]"
 
-def calculate_metrics_gpt(loss, input_tokens, target_tokens, tokenizer):
-    """Calculate perplexity and bits per byte for GPT with BPE tokenization"""
+def calculate_metrics(loss, tokens_in_batch, tokenizer):
+    """Calculate perplexity and bits per byte"""
     perplexity = torch.exp(loss).item()
     
-    # For BPE tokenization, we need to calculate bits per byte
-    # by converting tokens back to text and measuring byte length
-    try:
-        # Convert a sample of tokens to text to estimate compression ratio
-        sample_tokens = target_tokens[:min(1000, len(target_tokens))].cpu().tolist()
-        sample_text = tokenizer.decode(sample_tokens)
-        sample_bytes = len(sample_text.encode('utf-8'))
-        
-        # Estimate bits per byte
-        # loss is nats per token, convert to bits per byte
-        bits_per_token = loss.item() / math.log(2)  # Convert nats to bits
-        tokens_per_byte = len(sample_tokens) / sample_bytes if sample_bytes > 0 else 1.0
-        bits_per_byte = bits_per_token * tokens_per_byte
-        
-    except:
-        bits_per_byte = float('nan')  # Fallback if decoding fails
+    # For byte-level tokenization, bits per byte is straightforward
+    bits_per_byte = loss.item() / math.log(2)  # Convert from nats to bits
     
     return {
         'perplexity': perplexity,
@@ -649,11 +693,11 @@ def calculate_metrics_gpt(loss, input_tokens, target_tokens, tokenizer):
 @dataclass
 class Hyperparameters:
     # data
-    train_files = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
-    val_files = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
+    train_files = "data/fineweb10B_bytes/fineweb_train_*.bin" # input .bin to train on (byte-level)
+    val_files = "data/fineweb10B_bytes/fineweb_val_*.bin" # input .bin to eval validation loss on (byte-level)
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    train_seq_len = 48*1024 # FlexAttention sequence length
-    val_seq_len = 4*64*1024 # FlexAttention sequence length for validation
+    train_seq_len = 48*1024 # sequence length
+    val_seq_len = 4*64*1024 # sequence length for validation
     # optimization
     num_iterations = 1750 # number of iterations to run
     cooldown_frac = 0.45 # fraction of training spent cooling down the learning rate
@@ -668,7 +712,7 @@ class Hyperparameters:
     model_dim = 768
 
     # Experiment settings
-    experiment_name = "baseline"
+    experiment_name = "byte_level"
     output_dir = "logs"  # Output directory for logs
 
 args = Hyperparameters()
@@ -731,7 +775,8 @@ def nvidia_smi():
 print0(nvidia_smi())
 print0("="*100)
 
-model: nn.Module = GPT(vocab_size=50257, num_layers=12, num_heads=6, model_dim=768, max_seq_len=max(args.train_seq_len, args.val_seq_len)).cuda()
+# Create ByteGPT model with 256 vocab size (byte-level)
+model: nn.Module = ByteGPT(vocab_size=256, num_layers=12, num_heads=6, model_dim=768, max_seq_len=max(args.train_seq_len, args.val_seq_len)).cuda()
 for m in model.modules():
     if isinstance(m, nn.Embedding):
         m.bfloat16()
@@ -786,7 +831,7 @@ model: nn.Module = torch.compile(model, dynamic=False)
 warmup_steps = 10
 initial_state = dict(model=copy.deepcopy(model.state_dict()),
                      optimizers=[copy.deepcopy(opt.state_dict()) for opt in optimizers]) # save the initial state
-train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
+train_loader = distributed_data_generator_bytes(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
 for _ in range(warmup_steps):
     inputs, targets = next(train_loader)
     model(inputs, targets, get_window_size_blocks(1)).backward()
@@ -802,7 +847,7 @@ del train_loader, initial_state
 #        Training and validation       #
 ########################################
 
-train_loader = distributed_data_generator(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
+train_loader = distributed_data_generator_bytes(args.train_files, world_size * args.train_seq_len, align_to_bos=True)
 training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
@@ -821,33 +866,29 @@ for step in range(train_steps + 1):
         val_batch_size = world_size * args.val_seq_len
         assert args.val_tokens % val_batch_size == 0
         val_steps = args.val_tokens // val_batch_size
-        val_loader = distributed_data_generator(args.val_files, val_batch_size, align_to_bos=False)
+        val_loader = distributed_data_generator_bytes(args.val_files, val_batch_size, align_to_bos=False)
         val_loss = 0
-        sample_inputs, sample_targets = None, None
+        total_tokens = 0
         
         with torch.no_grad():
-            for i, (inputs, targets) in enumerate(val_loader):
-                if i >= val_steps:
-                    break
+            for _ in range(val_steps):
+                inputs, targets = next(val_loader)
                 val_loss += model(inputs, targets, get_window_size_blocks(step))
-                
-                # Save sample for metrics calculation
-                if i == 0:
-                    sample_inputs, sample_targets = inputs, targets
+                total_tokens += len(targets)
         
         val_loss /= val_steps
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         
         # Calculate metrics
-        tokenizer = tiktoken.get_encoding("gpt2")
-        metrics = calculate_metrics_gpt(val_loss, sample_inputs, sample_targets, tokenizer)
+        tokenizer = ByteTokenizer()
+        metrics = calculate_metrics(val_loss, total_tokens, tokenizer)
         
         # Generate text sample (only on master process to avoid spam)
         sample_text = ""
         if master_process and step % (args.val_loss_every * 2) == 0:  # Generate less frequently
             try:
-                sample_text = generate_text_sample_gpt(model, tokenizer, device, max_tokens=50, temperature=0.8)
+                sample_text = generate_text_sample(model, tokenizer, device, max_tokens=50, temperature=0.8)
                 print0(f"Generated sample: '{sample_text}'", console=True)
             except Exception as e:
                 print0(f"Generation failed: {e}", console=True)
